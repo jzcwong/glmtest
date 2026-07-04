@@ -1,0 +1,139 @@
+name: Deploy or Destroy Storage Stack (Bicep)
+
+# Manually triggered (workflow_dispatch). The user picks Deploy or Destroy from
+# a dropdown, supplies the required storageAccountName + resourceGroupName (the
+# RG is created by the Bicep template on deploy). Remaining Bicep parameters use
+# their defaults.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        default: 'deploy'
+        options:
+          - deploy
+          - destroy
+      storageAccountName:
+        description: 'Storage account name (3-24 chars, lowercase alphanumeric only). Required for both deploy and destroy.'
+        required: true
+        type: string
+      resourceGroupName:
+        description: 'Resource group to create (deploy) or delete (destroy). 1-90 chars, alphanumerics/.-_() and not ending in a dot.'
+        required: true
+        type: string
+      location:
+        description: 'Azure region — only used by deploy (Singapore = southeastasia)'
+        required: false
+        default: 'southeastasia'
+        type: string
+
+permissions:
+  id-token: write   # required for OIDC federated auth to Azure
+  contents: read
+
+concurrency:
+  group: storage-stack-${{ inputs.resourceGroupName }}
+  cancel-in-progress: false
+
+jobs:
+  manage:
+    runs-on: ubuntu-latest
+    environment: azure
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate names
+        run: |
+          acct="${{ inputs.storageAccountName }}"
+          rg="${{ inputs.resourceGroupName }}"
+          if ! echo "$acct" | grep -Eq '^[a-z0-9]{3,24}$'; then
+            echo "::error::storageAccountName must be 3-24 chars, lowercase alphanumeric only. Got: $acct"
+            exit 1
+          fi
+          if ! echo "$rg" | grep -Eq '^[a-zA-Z0-9._()-]{1,90}$' || echo "$rg" | grep -Eq '\.$'; then
+            echo "::error::resourceGroupName must be 1-90 chars (alphanumerics/.-_()) and not end in a dot. Got: $rg"
+            exit 1
+          fi
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      # ---------- DEPLOY ----------
+      # Subscription-scope deployment: the Bicep template creates the RG itself.
+      - name: Lint Bicep
+        if: inputs.mode == 'deploy'
+        run: az bicep build --file main.bicep
+
+      - name: Validate deployment (what-if)
+        if: inputs.mode == 'deploy'
+        run: |
+          az deployment sub validate \
+            --location "${{ inputs.location }}" \
+            --template-file main.bicep \
+            --parameters resourceGroupName="${{ inputs.resourceGroupName }}" \
+                         storageAccountName="${{ inputs.storageAccountName }}" \
+                         location="${{ inputs.location }}"
+
+      - name: Deploy
+        if: inputs.mode == 'deploy'
+        run: |
+          deployment="deploy-storage-$(date +%Y%m%d-%H%M%S)"
+          az deployment sub create \
+            --location "${{ inputs.location }}" \
+            --template-file main.bicep \
+            --parameters resourceGroupName="${{ inputs.resourceGroupName }}" \
+                         storageAccountName="${{ inputs.storageAccountName }}" \
+                         location="${{ inputs.location }}" \
+            --name "$deployment"
+          echo "Deployment name: $deployment"
+          az deployment sub show \
+            --name "$deployment" \
+            --query 'properties.outputs' \
+            -o json
+
+      # ---------- DESTROY ----------
+      # The "stack" is the resource group owned by this template (which contains
+      # the storage account and its child container). Deleting the RG removes all
+      # of it. We only touch the named RG, not the subscription.
+      - name: Confirm resource group exists
+        if: inputs.mode == 'destroy'
+        run: |
+          if az group show --name "${{ inputs.resourceGroupName }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_ENV"
+            echo "Resource group found, proceeding with delete."
+          else
+            echo "exists=false" >> "$GITHUB_ENV"
+            echo "::warning::Resource group '${{ inputs.resourceGroupName }}' not found. Nothing to destroy."
+          fi
+
+      - name: Destroy resource group
+        if: inputs.mode == 'destroy' && env.exists == 'true'
+        run: |
+          az group delete \
+            --name "${{ inputs.resourceGroupName }}" \
+            --yes \
+            --no-wait
+          echo "Resource group '${{ inputs.resourceGroupName }}' scheduled for deletion."
+
+      - name: Verify destruction
+        if: inputs.mode == 'destroy' && env.exists == 'true'
+        run: |
+          # Poll until the RG is gone (up to ~10 min) or fail the job.
+          for i in $(seq 1 60); do
+            if ! az group show --name "${{ inputs.resourceGroupName }}" > /dev/null 2>&1; then
+              echo "Verified: resource group no longer exists."
+              exit 0
+            fi
+            echo "Still deleting... (attempt $i/60)"
+            sleep 10
+          done
+          echo "::error::Resource group still exists after timeout — check Azure portal."
+          exit 1

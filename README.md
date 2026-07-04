@@ -34,7 +34,7 @@ All parameters have defaults except `storageAccountName` and `resourceGroupName`
 
 **Destroy** deletes the named resource group (which removes the storage account and its child container) and polls until deletion is confirmed.
 
-Auth uses an Azure service principal (client ID + client secret). Create the SP and store its credentials as a GitHub **secret** named `AZURE_CREDENTIALS` (the JSON output of `az ad sp create-for-rbac --role contributor --scopes /subscriptions/<sub-id> --json-auth`). Grant the SP **Contributor** on the target subscription so it can create the resource group.
+Auth uses an Azure service principal named **`github-storage-deployer`** (client ID + client secret). Create the SP and store its credentials as a GitHub **secret** named `AZURE_CREDENTIALS` (the JSON output of `az ad sp create-for-rbac --name github-storage-deployer --role contributor --scopes /subscriptions/<sub-id> --json-auth`). Grant the SP **Contributor** on the target subscription so it can create the resource group.
 
 ## Local deploy (alternative)
 
